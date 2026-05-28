@@ -57,6 +57,19 @@ const MAX_NAMESPACE_SIZE: usize = u16::MAX as usize;
 /// `UnpackEx` splitting that count into before-star and after-star halves).
 const MAX_UNPACK_TARGETS: usize = 255;
 
+/// Maximum number of `for ... in ...` clauses in a single comprehension.
+///
+/// `compile_comprehension_generators` recurses once per generator clause, so
+/// without an up-front guard a syntactically valid source file with tens of
+/// thousands of clauses can exhaust the Rust call stack during compilation —
+/// well before runtime resource limits become active. The cap also matches
+/// the `u8` operand consumed by `ListAppend` / `SetAdd` / `DictSetItem`:
+/// each additional generator adds one iterator layer (plus its target
+/// leaves) to the operand stack, and the bytecode format can only encode a
+/// `u8` depth. CPython has no equivalent limit but real Python comprehension
+/// usage is far below this cap.
+const MAX_COMP_GENERATORS: usize = 255;
+
 /// Converts a `usize` namespace size into the `u16` slot count expected by
 /// the bytecode, surfacing a `CompileError` if the limit is exceeded.
 ///
@@ -83,6 +96,23 @@ fn namespace_too_large(size: usize, kind: &'static str) -> CompileError {
 /// `UnpackSequence` (or the before/after halves of `UnpackEx`).
 fn check_unpack_targets(count: usize, position: CodeRange) -> Result<u8, CompileError> {
     u8::try_from(count).map_err(|_| too_many_unpack_targets(count, position))
+}
+
+/// Rejects comprehensions with more than [`MAX_COMP_GENERATORS`] for-clauses
+/// before recursive compilation, so attacker-controlled source cannot
+/// trigger a Rust stack overflow during `Compiler::compile_module`.
+///
+/// Anchored to the body expression's position because that's the
+/// comprehension's most stable location to point at in a traceback caret.
+fn check_comp_generators(count: usize, position: CodeRange) -> Result<(), CompileError> {
+    if count > MAX_COMP_GENERATORS {
+        Err(CompileError::new(
+            format!("comprehension has too many nested clauses ({count}); maximum is {MAX_COMP_GENERATORS}"),
+            position,
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Returns a position that locates `target` in source for error reporting.
@@ -2583,6 +2613,7 @@ impl<'a> Compiler<'a> {
         if self.code.is_dead() {
             return Ok(());
         }
+        check_comp_generators(generators.len(), elt.position)?;
         self.code.emit_u16(Opcode::BuildList, 0)?;
         let depth_after_collection = self
             .code
@@ -2606,6 +2637,7 @@ impl<'a> Compiler<'a> {
         if self.code.is_dead() {
             return Ok(());
         }
+        check_comp_generators(generators.len(), elt.position)?;
         self.code.emit_u16(Opcode::BuildSet, 0)?;
         let depth_after_collection = self
             .code
@@ -2634,6 +2666,7 @@ impl<'a> Compiler<'a> {
         if self.code.is_dead() {
             return Ok(());
         }
+        check_comp_generators(generators.len(), key.position)?;
         self.code.emit_u16(Opcode::BuildDict, 0)?;
         let depth_after_collection = self
             .code
